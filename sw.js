@@ -1,5 +1,5 @@
 // Réseau d'abord (les mises à jour arrivent dès la réouverture), copie en cache si hors ligne.
-const CACHE = 'prompteur-v6';
+const CACHE = 'prompteur-v7';
 const ASSETS = ['./', './index.html', './app.js', './manifest.webmanifest', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', e => {

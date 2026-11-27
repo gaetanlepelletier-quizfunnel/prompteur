@@ -15,7 +15,7 @@ const ICON = {
   pause: '<svg viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>',
 };
 
-const DEFAULTS = { wpm: 140, size: 44, margin: 6, lh: 1.35, guide: 30, theme: 'dark', align: 'left', mirrorX: false, mirrorY: false, countdown: true, cam: false, facing: 'user', q: '1080', mic: 3, micId: '' };
+const DEFAULTS = { wpm: 140, size: 44, margin: 6, lh: 1.35, guide: 30, theme: 'dark', align: 'left', mirrorX: false, mirrorY: false, countdown: true, cam: false, facing: 'user', q: '1080', micId: '' };
 let S = { ...DEFAULTS, ...store.get('prompteur.settings', {}) };
 
 const SAMPLE = `Bienvenue dans votre prompteur.
@@ -333,10 +333,12 @@ $('#settings').onclick = () => {
   if (sheetOpen()) return closeSheet();
   sheet.classList.add('open');
   refreshMics();
+  audioCtx();
+  buildMeter();
 };
 $('#sheet-close').onclick = closeSheet;
 
-const OUT = { wpm: v => v + ' mots/min', size: v => v + ' px', margin: v => v + ' %', lh: v => (+v).toFixed(2), guide: v => v + ' %', mic: v => '×' + v };
+const OUT = { wpm: v => v + ' mots/min', size: v => v + ' px', margin: v => v + ' %', lh: v => (+v).toFixed(2), guide: v => v + ' %' };
 
 function applySettings() {
   const st = pv.style;
@@ -352,7 +354,6 @@ function applySettings() {
   $('#cam-flip').hidden = $('#rec').hidden = !S.cam;
   $('#flip').style.transform = S.cam ? 'none' : `scale(${S.mirrorX ? -1 : 1},${S.mirrorY ? -1 : 1})`;
   $('#speed').textContent = S.wpm;
-  if (C.audio) C.audio.gain.gain.value = S.mic;
   store.set('prompteur.settings', S);
   syncSheet();
   layout();
@@ -416,8 +417,10 @@ if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.M
   S.cam = false;
 }
 
-// ---------- Son : amplification maison (compresseur + volume + limiteur) ----------
-// iOS exige que le moteur audio démarre pendant un toucher : audioCtx() est appelé dans les gestes.
+// ---------- Barre de niveau du micro (réglages uniquement) ----------
+// L'enregistrement utilise TOUJOURS le son brut du micro, sur la même horloge que la caméra.
+// (Faire passer le son par un traitement audio désynchronisait l'enregistreur iOS : image figée, son qui continue.)
+// La barre n'écoute le micro que pendant que les réglages sont ouverts, jamais pendant un enregistrement.
 let AC = null;
 function audioCtx() {
   try {
@@ -426,34 +429,26 @@ function audioCtx() {
   } catch { AC = null; }
   return AC;
 }
-const setParams = (node, params) => { for (const k in params) node[k].value = params[k]; return node; };
-function buildAudio() {
+function buildMeter() {
   teardownAudio();
   const tracks = C.stream ? C.stream.getAudioTracks() : [];
-  if (!AC || !tracks.length) return;
+  if (!AC || !tracks.length || isRec()) return;
   try {
     const src = AC.createMediaStreamSource(new MediaStream(tracks));
-    const comp = setParams(AC.createDynamicsCompressor(), { threshold: -24, knee: 20, ratio: 3, attack: 0.005, release: 0.25 });
-    const gain = AC.createGain();
-    gain.gain.value = S.mic;
-    const lim = setParams(AC.createDynamicsCompressor(), { threshold: -4, knee: 0, ratio: 20, attack: 0.001, release: 0.1 });
     const an = AC.createAnalyser();
     an.fftSize = 1024;
-    const dest = AC.createMediaStreamDestination();
-    src.connect(comp).connect(gain).connect(lim);
-    lim.connect(dest);
-    lim.connect(an);
-    C.audio = { src, gain, lim, an, dest, buf: new Float32Array(an.fftSize) };
+    src.connect(an);
+    C.audio = { src, an, buf: new Float32Array(an.fftSize) };
   } catch { C.audio = null; }
 }
 function teardownAudio() {
   if (!C.audio) return;
-  try { C.audio.src.disconnect(); C.audio.lim.disconnect(); } catch {}
+  try { C.audio.src.disconnect(); } catch {}
   C.audio = null;
 }
-// Barre de niveau du micro (dans les réglages et pendant l'enregistrement)
 setInterval(() => {
-  if (!C.audio || view !== 'prompter' || !(sheetOpen() || isRec())) return;
+  if (C.audio && !sheetOpen()) teardownAudio();
+  if (!C.audio || view !== 'prompter') return;
   const { an, buf } = C.audio;
   an.getFloatTimeDomainData(buf);
   let peak = 0;
@@ -465,7 +460,6 @@ setInterval(() => {
 
 async function camOn() {
   if (!$('#result').hidden) return; // pas de caméra pendant la relecture
-  audioCtx();
   const req = ++C.req;
   camStop();
   const [w, h] = S.q === '720' ? [1280, 720] : [1920, 1080];
@@ -495,8 +489,8 @@ async function camOn() {
   // L'utilisateur a quitté ou coupé la caméra pendant la demande d'autorisation
   if (req !== C.req || view !== 'prompter' || !S.cam) { stream.getTracks().forEach(t => t.stop()); return; }
   C.stream = stream;
-  buildAudio();
   refreshMics();
+  if (sheetOpen()) buildMeter();
   camV.srcObject = stream;
   camV.classList.toggle('mirror', S.facing === 'user');
   camV.play().catch(() => {});
@@ -586,25 +580,19 @@ function makeRecorder() {
   C.lastErr = '';
   const opts = { videoBitsPerSecond: S.q === '720' ? 5e6 : 8e6, audioBitsPerSecond: 128000 };
   if (MIME) opts.mimeType = MIME;
-  const tries = [];
-  if (!C.noBoost && C.audio && AC && AC.state === 'running') {
-    const boosted = new MediaStream([...C.stream.getVideoTracks(), ...C.audio.dest.stream.getAudioTracks()]);
-    tries.push([boosted, opts, true], [boosted, {}, true]);
-  }
-  tries.push([C.stream, opts, false], [C.stream, {}, false]);
-  for (const [stream, o, boosted] of tries) {
+  teardownAudio(); // personne d'autre n'écoute le micro pendant l'enregistrement
+  for (const o of [opts, {}]) {
     let r;
     try {
-      r = new MediaRecorder(stream, o);
+      r = new MediaRecorder(C.stream, o); // image + son bruts : mêmes horloges
       r.ondataavailable = e => { if (e.data && e.data.size) C.chunks.push(e.data); };
       r.onerror = e => {
-        if (boosted) C.noBoost = true; // la prochaine fois : son simple
         C.lastErr = (e.error && (e.error.name + ' ' + e.error.message)) || 'erreur';
         recStop();
       };
       r.onstop = recDone;
       r.start(); // sans découpage : plus fiable sur Safari
-      if (r.state === 'recording') { C.recBoosted = boosted; return r; }
+      if (r.state === 'recording') return r;
     } catch (e) {
       C.lastErr = e.name + ' ' + e.message;
     }
@@ -632,8 +620,7 @@ function recDone() {
   C.chunks = [];
   C.rec = null;
   if (!blob.size) {
-    if (C.recBoosted) C.noBoost = true;
-    ask('L’enregistrement a échoué' + (C.recBoosted ? ' avec le son amplifié. Réessayez : l’appli passe en son simple.' : '.') +
+    ask('L’enregistrement a échoué.' +
       (C.lastErr ? '\n(' + C.lastErr + ')' : ''), { cancel: null });
     return;
   }
@@ -660,7 +647,6 @@ function closeResult() {
 }
 
 $('#rec').onclick = () => {
-  audioCtx();
   if (isRec()) recStop();
   else if (P.counting) pause();
   else recStart();
