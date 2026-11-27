@@ -15,7 +15,7 @@ const ICON = {
   pause: '<svg viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>',
 };
 
-const DEFAULTS = { wpm: 140, size: 44, margin: 6, lh: 1.35, guide: 30, theme: 'dark', align: 'left', mirrorX: false, mirrorY: false, countdown: true, cam: false, facing: 'user', q: '1080', mic: 3 };
+const DEFAULTS = { wpm: 140, size: 44, margin: 6, lh: 1.35, guide: 30, theme: 'dark', align: 'left', mirrorX: false, mirrorY: false, countdown: true, cam: false, facing: 'user', q: '1080', mic: 3, micId: '' };
 let S = { ...DEFAULTS, ...store.get('prompteur.settings', {}) };
 
 const SAMPLE = `Bienvenue dans votre prompteur.
@@ -329,7 +329,11 @@ new ResizeObserver(() => layout()).observe(stage);
 // ---------- Réglages ----------
 const sheetOpen = () => sheet.classList.contains('open');
 const closeSheet = () => sheet.classList.remove('open');
-$('#settings').onclick = () => (sheetOpen() ? closeSheet() : sheet.classList.add('open'));
+$('#settings').onclick = () => {
+  if (sheetOpen()) return closeSheet();
+  sheet.classList.add('open');
+  refreshMics();
+};
 $('#sheet-close').onclick = closeSheet;
 
 const OUT = { wpm: v => v + ' mots/min', size: v => v + ' px', margin: v => v + ' %', lh: v => (+v).toFixed(2), guide: v => v + ' %', mic: v => '×' + v };
@@ -463,15 +467,24 @@ async function camOn() {
   const req = ++C.req;
   camStop();
   const [w, h] = S.q === '720' ? [1280, 720] : [1920, 1080];
+  // Sans ces options, le micro passe en mode « appel téléphonique » : son étouffé et qui pompe.
+  const audio = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+  if (S.micId) audio.deviceId = { exact: S.micId };
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: S.facing, width: { ideal: w }, height: { ideal: h }, frameRate: { ideal: 30, max: 30 } },
-      // Sans ces options, le micro passe en mode « appel téléphonique » : son étouffé et qui pompe.
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      audio,
     });
   } catch (e) {
     if (req !== C.req) return;
+    if (S.micId && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError')) {
+      // Le micro choisi est débranché : on repasse en automatique.
+      S.micId = '';
+      applySettings();
+      toast('Micro introuvable, retour au micro automatique');
+      return camOn();
+    }
     S.cam = false;
     applySettings();
     ask('Impossible d’accéder à la caméra. Autorisez la caméra et le micro dans Réglages > Safari, puis réessayez.', { cancel: null });
@@ -481,6 +494,7 @@ async function camOn() {
   if (req !== C.req || view !== 'prompter' || !S.cam) { stream.getTracks().forEach(t => t.stop()); return; }
   C.stream = stream;
   buildAudio();
+  refreshMics();
   camV.srcObject = stream;
   camV.classList.toggle('mirror', S.facing === 'user');
   camV.play().catch(() => {});
@@ -490,6 +504,40 @@ function camStop() {
   if (C.stream) C.stream.getTracks().forEach(t => t.stop());
   C.stream = null;
   camV.srcObject = null;
+}
+
+// ---------- Choix du micro (ex. récepteur DJI Mic branché sur l'iPhone) ----------
+async function refreshMics() {
+  let devs = [];
+  try { devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId && d.deviceId !== 'default'); } catch {}
+  const sel = $('#mic-select');
+  sel.innerHTML = '';
+  const add = (v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.append(o); };
+  add('', 'Automatique (micro branché en priorité)');
+  devs.forEach((d, i) => add(d.deviceId, d.label || `Micro ${i + 1}`));
+  sel.value = devs.some(d => d.deviceId === S.micId) ? S.micId : '';
+  if (C.stream) C.micKeys = devs.map(d => d.deviceId).sort().join('|');
+  const t = C.stream && C.stream.getAudioTracks()[0];
+  $('#mic-used').textContent = t ? 'Micro utilisé : ' + (t.label || 'inconnu') : 'Activez le mode caméra pour voir les micros disponibles.';
+}
+$('#mic-select').onchange = e => {
+  S.micId = e.target.value;
+  applySettings();
+  if (S.cam && !isRec()) camOn();
+};
+// Récepteur branché ou débranché pendant que la caméra est ouverte : on reprend le bon micro.
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', () => {
+    clearTimeout(C.dcT);
+    C.dcT = setTimeout(async () => {
+      const before = C.micKeys;
+      await refreshMics();
+      if (before && C.micKeys !== before && S.cam && C.stream && view === 'prompter' && !isRec() && $('#result').hidden) {
+        toast('Changement de micro détecté');
+        camOn();
+      }
+    }, 700);
+  });
 }
 
 $('#cam-btn').onclick = () => {
