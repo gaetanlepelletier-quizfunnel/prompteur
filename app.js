@@ -89,7 +89,11 @@ addEventListener('popstate', e => {
   if (st.v !== 'library' && !getScript(st.id)) st = { v: 'library' };
   show(st.v, st.id, false);
 });
-$$('[data-back]').forEach(b => b.addEventListener('click', () => history.back()));
+$$('[data-back]').forEach(b => b.addEventListener('click', () => {
+  // Pendant un enregistrement, « retour » arrête d'abord la vidéo (et l'affiche) au lieu de quitter l'écran.
+  if (view === 'prompter' && isRec()) { recStop(); return; }
+  history.back();
+}));
 
 // Hauteur réelle de l'écran (clavier iOS / barres du navigateur)
 const vv = window.visualViewport;
@@ -225,7 +229,8 @@ function start() {
   updatePlayBtn();
 }
 function play() {
-  if (!P.words) return;
+  keepAwake(true); // redemandé à chaque lancement (un toucher) : iOS peut l'avoir relâché
+  if (!P.words) { toast('Ce script ne contient aucun mot à lire'); return; }
   if (P.pos >= maxPos() - 1) P.pos = 0;
   closeSheet();
   if (S.countdown && P.pos < 1) countdown(start); else start();
@@ -276,6 +281,7 @@ $('#slower').onclick = () => setSpeed(S.wpm - 10);
 $('#faster').onclick = () => setSpeed(S.wpm + 10);
 
 // Toucher : tap = lecture/pause, glisser = déplacer le texte
+const dragDir = () => (S.mirrorY && !S.cam ? -1 : 1); // le miroir n'est pas appliqué en mode caméra
 stage.addEventListener('pointerdown', e => {
   if (e.button > 0) return;
   P.ptr = { y: e.clientY, pos: P.pos, moved: false };
@@ -291,7 +297,7 @@ stage.addEventListener('pointermove', e => {
     p.y = e.clientY;
     dy = 0;
   }
-  P.pos = clamp(p.pos - dy * (S.mirrorY ? -1 : 1), 0, maxPos());
+  P.pos = clamp(p.pos - dy * dragDir(), 0, maxPos());
   render();
 });
 const endPtr = isTap => () => {
@@ -305,7 +311,7 @@ stage.addEventListener('pointerup', endPtr(true));
 stage.addEventListener('pointercancel', endPtr(false));
 stage.addEventListener('wheel', e => {
   e.preventDefault();
-  P.pos = clamp(P.pos + e.deltaY * (S.mirrorY ? -1 : 1), 0, maxPos());
+  P.pos = clamp(P.pos + e.deltaY * dragDir(), 0, maxPos());
   render();
 }, { passive: false });
 
@@ -318,7 +324,7 @@ document.addEventListener('keydown', e => {
   else if (k === 'ArrowUp' || k === 'PageUp') nudge(-1);
   else if (k === 'ArrowRight' || k === '+') setSpeed(S.wpm + 10);
   else if (k === 'ArrowLeft' || k === '-') setSpeed(S.wpm - 10);
-  else if (k === 'Escape') { if (sheetOpen()) closeSheet(); else history.back(); }
+  else if (k === 'Escape') { if (sheetOpen()) closeSheet(); else if (isRec()) recStop(); else history.back(); }
   else return;
   e.preventDefault();
   if (document.activeElement && document.activeElement.tagName === 'BUTTON') document.activeElement.blur();
@@ -333,8 +339,7 @@ $('#settings').onclick = () => {
   if (sheetOpen()) return closeSheet();
   sheet.classList.add('open');
   refreshMics();
-  audioCtx();
-  buildMeter();
+  if (!isRec()) { audioCtx(); buildMeter(); } // jamais de moteur audio pendant un enregistrement
 };
 $('#sheet-close').onclick = closeSheet;
 
@@ -376,14 +381,17 @@ $$('#sheet .seg button').forEach(b => b.addEventListener('click', () => {
   applySettings();
   if (k === 'q' && S.cam && !isRec()) camOn();
 }));
-$('#reset').onclick = () => { S = { ...DEFAULTS }; applySettings(); };
+// Garde le mode caméra et le micro : réinitialiser l'affichage ne doit pas couper un enregistrement.
+$('#reset').onclick = () => { S = { ...DEFAULTS, cam: S.cam, facing: S.facing, micId: S.micId, q: S.q }; applySettings(); };
 
 // ---------- Écran toujours allumé ----------
 let lock = null;
 async function keepAwake(on) {
   try {
     if (on && 'wakeLock' in navigator && !lock) {
-      lock = await navigator.wakeLock.request('screen');
+      const l = await navigator.wakeLock.request('screen');
+      if (view !== 'prompter') { l.release(); return; } // on a quitté le prompteur entre-temps
+      lock = l;
       lock.addEventListener('release', () => { lock = null; });
     } else if (!on && lock) {
       await lock.release();
@@ -397,11 +405,29 @@ document.addEventListener('visibilitychange', () => {
     pause();
   } else if (view === 'prompter') {
     keepAwake(true);
-    if (AC && AC.state !== 'running') AC.resume().catch(() => {});
+    if (C.audio && AC && AC.state !== 'running') AC.resume().catch(() => {});
     const track = C.stream && C.stream.getVideoTracks()[0];
     if (S.cam && (!track || track.readyState === 'ended')) camOn();
   }
 });
+
+// ---------- Copie de secours de la dernière vidéo (IndexedDB) ----------
+const idb = (() => {
+  let dbp;
+  const open = () => dbp || (dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('prompteur', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('v');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  }));
+  const run = (mode, fn) => open().then(db => new Promise((res, rej) => {
+    const tx = db.transaction('v', mode);
+    const q = fn(tx.objectStore('v'));
+    tx.oncomplete = () => res(q.result);
+    tx.onerror = () => rej(tx.error);
+  }));
+  return { get: k => run('readonly', s => s.get(k)), set: (k, v) => run('readwrite', s => s.put(v, k)), del: k => run('readwrite', s => s.delete(k)) };
+})();
 
 // ---------- Caméra et enregistrement ----------
 const camV = $('#cam');
@@ -445,6 +471,8 @@ function teardownAudio() {
   if (!C.audio) return;
   try { C.audio.src.disconnect(); } catch {}
   C.audio = null;
+  // Moteur audio en veille quand la barre est fermée : il ne doit rien toucher pendant un enregistrement.
+  if (AC && AC.state === 'running') AC.suspend().catch(() => {});
 }
 setInterval(() => {
   if (C.audio && !sheetOpen()) teardownAudio();
@@ -489,6 +517,21 @@ async function camOn() {
   // L'utilisateur a quitté ou coupé la caméra pendant la demande d'autorisation
   if (req !== C.req || view !== 'prompter' || !S.cam) { stream.getTracks().forEach(t => t.stop()); return; }
   C.stream = stream;
+  // Filet de sécurité : si l'iPhone coupe la caméra pendant un enregistrement (appel, Siri, surchauffe…),
+  // on arrête proprement et on garde la vidéo jusque-là, au lieu de filmer une image figée.
+  const vt = stream.getVideoTracks()[0];
+  if (vt) {
+    const interrupted = () => {
+      if (!isRec() || C.stream !== stream) return;
+      C.interrupted = true;
+      recStop();
+    };
+    vt.addEventListener('ended', interrupted);
+    vt.addEventListener('mute', () => {
+      clearTimeout(C.muteT);
+      C.muteT = setTimeout(() => { if (vt.muted) interrupted(); }, 2000);
+    });
+  }
   refreshMics();
   if (sheetOpen()) buildMeter();
   camV.srcObject = stream;
@@ -554,6 +597,7 @@ function recTick() {
 }
 function recStart() {
   if (!C.stream) { toast('Caméra pas encore prête'); return; }
+  pause(); // le texte ne doit pas défiler pendant le compte à rebours
   if (P.pos >= maxPos() - 1) P.pos = 0;
   closeSheet();
   const go = () => {
@@ -574,7 +618,7 @@ function recStart() {
   };
   if (S.countdown) countdown(go); else go();
 }
-// Essaie d'abord le son amplifié, puis le son brut, avec puis sans options : on prend le premier qui démarre.
+// Enregistre le flux brut (image + son du même flux), avec puis sans options : on prend le premier qui démarre.
 function makeRecorder() {
   C.chunks = [];
   C.lastErr = '';
@@ -588,10 +632,12 @@ function makeRecorder() {
       r.ondataavailable = e => { if (e.data && e.data.size) C.chunks.push(e.data); };
       r.onerror = e => {
         C.lastErr = (e.error && (e.error.name + ' ' + e.error.message)) || 'erreur';
-        recStop();
+        recStop(); // attend « onstop » (les données déjà filmées arrivent avec)
       };
       r.onstop = recDone;
-      r.start(); // sans découpage : plus fiable sur Safari
+      // Écriture par morceaux d'une seconde : contourne le bug d'iOS 26 qui perdait la fin des vidéos MP4
+      // (image figée après ~15 s, son qui continue — WebKit bug 299164).
+      r.start(1000);
       if (r.state === 'recording') return r;
     } catch (e) {
       C.lastErr = e.name + ' ' + e.message;
@@ -600,18 +646,29 @@ function makeRecorder() {
   }
   return null;
 }
+// Arrêt en deux temps : l'iPhone met un moment à finaliser le fichier (la vidéo arrive juste avant « onstop »).
+// Pendant ce temps, un 2e appui / retour / verrouillage ne doit surtout pas jeter la vidéo.
 function recStop() {
   pause();
-  if (!C.recording) return;
+  if (!C.recording || C.stopping) return;
+  C.stopping = true;
+  clearInterval(C.timer);
+  $('#rec').classList.remove('on');
+  $('#rec-time').hidden = true;
+  toast('Finalisation de la vidéo…');
   const r = C.rec;
+  let wait = 2000; // enregistreur déjà arrêté (erreur) : ses données sont en route
   if (r && r.state !== 'inactive') {
-    try { r.stop(); return; } catch {} // recDone() arrivera via onstop
+    try { r.stop(); wait = 20000; } catch {}
   }
-  recDone(); // l'enregistreur est déjà mort : on nettoie quand même l'écran
+  clearTimeout(C.stopT);
+  C.stopT = setTimeout(recDone, wait); // filet si « onstop » n'arrive jamais
 }
 function recDone() {
   if (!C.recording) return; // déjà traité
+  clearTimeout(C.stopT);
   C.recording = false;
+  C.stopping = false;
   clearInterval(C.timer);
   $('#rec').classList.remove('on');
   $('#rec-time').hidden = true;
@@ -620,10 +677,19 @@ function recDone() {
   C.chunks = [];
   C.rec = null;
   if (!blob.size) {
+    C.interrupted = false;
     ask('L’enregistrement a échoué.' +
       (C.lastErr ? '\n(' + C.lastErr + ')' : ''), { cancel: null });
     return;
   }
+  showResult(blob);
+  idb.set('last', blob).catch(() => {}); // copie de secours tant que la vidéo n'est pas enregistrée dans Photos
+  if (C.interrupted) {
+    C.interrupted = false;
+    ask('L’iPhone a interrompu la caméra pendant l’enregistrement (appel, notification, surchauffe…). La vidéo a été gardée jusqu’à ce moment-là.', { cancel: null });
+  }
+}
+function showResult(blob) {
   // On libère la caméra pendant la relecture : caméra + lecture vidéo en même temps peuvent figer l'iPhone.
   C.req++;
   camStop();
@@ -635,6 +701,7 @@ function recDone() {
   $('#result').hidden = false;
 }
 function closeResult() {
+  idb.del('last').catch(() => {});
   $('#result').hidden = true;
   const v = $('#result-video');
   v.pause();
@@ -647,6 +714,7 @@ function closeResult() {
 }
 
 $('#rec').onclick = () => {
+  keepAwake(true);
   if (isRec()) recStop();
   else if (P.counting) pause();
   else recStart();
@@ -711,3 +779,7 @@ history.replaceState({ v: 'library' }, '');
 applySettings();
 updatePlayBtn();
 renderLibrary();
+// Une vidéo filmée mais pas encore enregistrée dans Photos (appli fermée entre-temps) ? On la repropose.
+idb.get('last').then(b => {
+  if (b && b.size && $('#result').hidden && !isRec()) { showResult(b); toast('Vidéo non enregistrée récupérée'); }
+}).catch(() => {});
