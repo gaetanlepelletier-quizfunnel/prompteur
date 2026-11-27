@@ -407,7 +407,9 @@ const camV = $('#cam');
 const C = { stream: null, rec: null, chunks: [], t0: 0, timer: 0, blob: null, url: '', saved: false, req: 0 };
 const MIME = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm']
   .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
-const isRec = () => !!C.rec && C.rec.state === 'recording';
+// L'appli tient elle-même l'état « en train de filmer » : si l'enregistreur d'iOS plante,
+// le bouton doit quand même arrêter (et pas relancer un compte à rebours).
+const isRec = () => C.recording === true;
 
 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
   $('#cam-btn').hidden = true;
@@ -561,18 +563,14 @@ function recStart() {
   if (P.pos >= maxPos() - 1) P.pos = 0;
   closeSheet();
   const go = () => {
-    if (!C.stream) return;
-    C.chunks = [];
-    const opts = { videoBitsPerSecond: S.q === '720' ? 5e6 : 8e6, audioBitsPerSecond: 128000 };
-    if (MIME) opts.mimeType = MIME;
-    // Son amplifié si le moteur audio tourne ; sinon son brut (jamais de vidéo muette).
-    const boosted = C.audio && AC && AC.state === 'running';
-    const stream = boosted ? new MediaStream([...C.stream.getVideoTracks(), ...C.audio.dest.stream.getAudioTracks()]) : C.stream;
-    try { C.rec = new MediaRecorder(stream, opts); }
-    catch { C.rec = new MediaRecorder(stream); }
-    C.rec.ondataavailable = e => { if (e.data && e.data.size) C.chunks.push(e.data); };
-    C.rec.onstop = recDone;
-    C.rec.start(); // sans découpage : plus fiable sur Safari
+    if (!C.stream) { toast('Caméra pas encore prête'); return; }
+    const rec = makeRecorder();
+    if (!rec) {
+      ask('Impossible de démarrer l’enregistrement sur cet appareil.\n(' + (C.lastErr || 'erreur inconnue') + ')', { cancel: null });
+      return;
+    }
+    C.rec = rec;
+    C.recording = true;
     C.t0 = Date.now();
     recTick();
     C.timer = setInterval(recTick, 500);
@@ -582,18 +580,63 @@ function recStart() {
   };
   if (S.countdown) countdown(go); else go();
 }
+// Essaie d'abord le son amplifié, puis le son brut, avec puis sans options : on prend le premier qui démarre.
+function makeRecorder() {
+  C.chunks = [];
+  C.lastErr = '';
+  const opts = { videoBitsPerSecond: S.q === '720' ? 5e6 : 8e6, audioBitsPerSecond: 128000 };
+  if (MIME) opts.mimeType = MIME;
+  const tries = [];
+  if (!C.noBoost && C.audio && AC && AC.state === 'running') {
+    const boosted = new MediaStream([...C.stream.getVideoTracks(), ...C.audio.dest.stream.getAudioTracks()]);
+    tries.push([boosted, opts, true], [boosted, {}, true]);
+  }
+  tries.push([C.stream, opts, false], [C.stream, {}, false]);
+  for (const [stream, o, boosted] of tries) {
+    let r;
+    try {
+      r = new MediaRecorder(stream, o);
+      r.ondataavailable = e => { if (e.data && e.data.size) C.chunks.push(e.data); };
+      r.onerror = e => {
+        if (boosted) C.noBoost = true; // la prochaine fois : son simple
+        C.lastErr = (e.error && (e.error.name + ' ' + e.error.message)) || 'erreur';
+        recStop();
+      };
+      r.onstop = recDone;
+      r.start(); // sans découpage : plus fiable sur Safari
+      if (r.state === 'recording') { C.recBoosted = boosted; return r; }
+    } catch (e) {
+      C.lastErr = e.name + ' ' + e.message;
+    }
+    try { if (r) { r.onstop = r.onerror = null; if (r.state !== 'inactive') r.stop(); } } catch {}
+  }
+  return null;
+}
 function recStop() {
-  if (isRec()) C.rec.stop();
   pause();
+  if (!C.recording) return;
+  const r = C.rec;
+  if (r && r.state !== 'inactive') {
+    try { r.stop(); return; } catch {} // recDone() arrivera via onstop
+  }
+  recDone(); // l'enregistreur est déjà mort : on nettoie quand même l'écran
 }
 function recDone() {
+  if (!C.recording) return; // déjà traité
+  C.recording = false;
   clearInterval(C.timer);
   $('#rec').classList.remove('on');
   $('#rec-time').hidden = true;
+  pause();
   const blob = new Blob(C.chunks, { type: (C.rec && C.rec.mimeType) || MIME || 'video/mp4' });
   C.chunks = [];
   C.rec = null;
-  if (!blob.size) { toast('L’enregistrement a échoué'); return; }
+  if (!blob.size) {
+    if (C.recBoosted) C.noBoost = true;
+    ask('L’enregistrement a échoué' + (C.recBoosted ? ' avec le son amplifié. Réessayez : l’appli passe en son simple.' : '.') +
+      (C.lastErr ? '\n(' + C.lastErr + ')' : ''), { cancel: null });
+    return;
+  }
   // On libère la caméra pendant la relecture : caméra + lecture vidéo en même temps peuvent figer l'iPhone.
   C.req++;
   camStop();
