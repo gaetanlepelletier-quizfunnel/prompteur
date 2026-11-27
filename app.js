@@ -15,7 +15,7 @@ const ICON = {
   pause: '<svg viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>',
 };
 
-const DEFAULTS = { wpm: 140, size: 44, margin: 6, lh: 1.35, guide: 30, theme: 'dark', align: 'left', mirrorX: false, mirrorY: false, countdown: true, cam: false, facing: 'user' };
+const DEFAULTS = { wpm: 140, size: 44, margin: 6, lh: 1.35, guide: 30, theme: 'dark', align: 'left', mirrorX: false, mirrorY: false, countdown: true, cam: false, facing: 'user', q: '1080' };
 let S = { ...DEFAULTS, ...store.get('prompteur.settings', {}) };
 
 const SAMPLE = `Bienvenue dans votre prompteur.
@@ -33,6 +33,23 @@ Le bouton réglages permet de changer la taille du texte, les marges, la positio
 L'écran reste allumé pendant la lecture.
 
 Bon tournage !`;
+
+// Fenêtre de confirmation maison : confirm()/alert() peuvent bloquer l'écran
+// dans une appli installée sur l'écran d'accueil de l'iPhone.
+function ask(msg, { ok = 'OK', cancel = 'Annuler', danger = false } = {}) {
+  return new Promise(resolve => {
+    const d = $('#dialog'), okB = $('#dialog-ok'), noB = $('#dialog-cancel');
+    $('#dialog-msg').textContent = msg;
+    okB.textContent = ok;
+    okB.classList.toggle('danger', danger);
+    noB.hidden = !cancel;
+    if (cancel) noB.textContent = cancel;
+    const done = v => { d.hidden = true; okB.onclick = noB.onclick = null; resolve(v); };
+    okB.onclick = () => done(true);
+    noB.onclick = () => done(false);
+    d.hidden = false;
+  });
+}
 
 // ---------- Données ----------
 let scripts = store.get('prompteur.scripts', null);
@@ -135,8 +152,8 @@ function leaveEditor() {
   const s = getScript(current);
   if (s && !s.text.trim()) { scripts = scripts.filter(x => x !== s); saveScripts(); }
 }
-$('#del').onclick = () => {
-  if (!confirm('Supprimer ce script ?')) return;
+$('#del').onclick = async () => {
+  if (!(await ask('Supprimer ce script ?', { ok: 'Supprimer', danger: true }))) return;
   scripts = scripts.filter(x => x.id !== current);
   saveScripts();
   history.back();
@@ -294,7 +311,7 @@ stage.addEventListener('wheel', e => {
 
 // Clavier et télécommandes Bluetooth (qui envoient espace / flèches / page suivante)
 document.addEventListener('keydown', e => {
-  if (view !== 'prompter' || !$('#result').hidden) return;
+  if (view !== 'prompter' || !$('#result').hidden || !$('#dialog').hidden) return;
   const k = e.key;
   if (k === ' ' || k === 'Enter') toggle();
   else if (k === 'ArrowDown' || k === 'PageDown') nudge(1);
@@ -346,7 +363,13 @@ function syncSheet() {
 }
 $$('#sheet input[type=range]').forEach(el => el.addEventListener('input', () => { S[el.dataset.k] = +el.value; applySettings(); }));
 $$('#sheet input[type=checkbox]').forEach(el => el.addEventListener('change', () => { S[el.dataset.k] = el.checked; applySettings(); }));
-$$('#sheet .seg button').forEach(b => b.addEventListener('click', () => { S[b.parentNode.dataset.k] = b.dataset.v; applySettings(); }));
+$$('#sheet .seg button').forEach(b => b.addEventListener('click', () => {
+  const k = b.parentNode.dataset.k;
+  if (S[k] === b.dataset.v) return;
+  S[k] = b.dataset.v;
+  applySettings();
+  if (k === 'q' && S.cam && !isRec()) camOn();
+}));
 $('#reset').onclick = () => { S = { ...DEFAULTS }; applySettings(); };
 
 // ---------- Écran toujours allumé ----------
@@ -386,19 +409,22 @@ if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.M
 }
 
 async function camOn() {
+  if (!$('#result').hidden) return; // pas de caméra pendant la relecture
   const req = ++C.req;
   camStop();
+  const [w, h] = S.q === '720' ? [1280, 720] : [1920, 1080];
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: S.facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
-      audio: true,
+      video: { facingMode: S.facing, width: { ideal: w }, height: { ideal: h }, frameRate: { ideal: 30, max: 30 } },
+      // Sans ces options, le micro passe en mode « appel téléphonique » : son étouffé et qui pompe.
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     });
   } catch (e) {
     if (req !== C.req) return;
     S.cam = false;
     applySettings();
-    alert('Impossible d’accéder à la caméra. Autorisez la caméra et le micro dans Réglages > Safari (ou dans les réglages de l’app), puis réessayez.');
+    ask('Impossible d’accéder à la caméra. Autorisez la caméra et le micro dans Réglages > Safari, puis réessayez.', { cancel: null });
     return;
   }
   // L'utilisateur a quitté ou coupé la caméra pendant la demande d'autorisation
@@ -437,11 +463,13 @@ function recStart() {
   const go = () => {
     if (!C.stream) return;
     C.chunks = [];
-    try { C.rec = new MediaRecorder(C.stream, MIME ? { mimeType: MIME, videoBitsPerSecond: 8e6 } : {}); }
+    const opts = { videoBitsPerSecond: S.q === '720' ? 5e6 : 8e6, audioBitsPerSecond: 128000 };
+    if (MIME) opts.mimeType = MIME;
+    try { C.rec = new MediaRecorder(C.stream, opts); }
     catch { C.rec = new MediaRecorder(C.stream); }
     C.rec.ondataavailable = e => { if (e.data && e.data.size) C.chunks.push(e.data); };
     C.rec.onstop = recDone;
-    C.rec.start(1000);
+    C.rec.start(); // sans découpage : plus fiable sur Safari
     C.t0 = Date.now();
     recTick();
     C.timer = setInterval(recTick, 500);
@@ -461,7 +489,11 @@ function recDone() {
   $('#rec-time').hidden = true;
   const blob = new Blob(C.chunks, { type: (C.rec && C.rec.mimeType) || MIME || 'video/mp4' });
   C.chunks = [];
+  C.rec = null;
   if (!blob.size) { toast('L’enregistrement a échoué'); return; }
+  // On libère la caméra pendant la relecture : caméra + lecture vidéo en même temps peuvent figer l'iPhone.
+  C.req++;
+  camStop();
   if (C.url) URL.revokeObjectURL(C.url);
   C.blob = blob;
   C.saved = false;
@@ -478,6 +510,7 @@ function closeResult() {
   if (C.url) URL.revokeObjectURL(C.url);
   C.url = '';
   C.blob = null;
+  if (S.cam && view === 'prompter') camOn();
 }
 
 $('#rec').onclick = () => {
@@ -502,9 +535,11 @@ $('#save-video').onclick = async () => {
     C.saved = true;
   }
 };
-$('#discard').onclick = () => { if (confirm('Supprimer cette vidéo ?')) closeResult(); };
-$('#result-done').onclick = () => {
-  if (!C.saved && !confirm('Cette vidéo n’a pas été enregistrée. La supprimer ?')) return;
+$('#discard').onclick = async () => {
+  if (await ask('Supprimer cette vidéo ?', { ok: 'Supprimer', danger: true })) closeResult();
+};
+$('#result-done').onclick = async () => {
+  if (!C.saved && !(await ask('Cette vidéo n’a pas été enregistrée dans Photos. La supprimer ?', { ok: 'Supprimer', cancel: 'Garder', danger: true }))) return;
   closeResult();
 };
 

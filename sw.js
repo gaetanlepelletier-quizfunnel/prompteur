@@ -1,5 +1,5 @@
-// Hors ligne : on sert la copie en cache tout de suite, et on la met à jour en arrière-plan.
-const CACHE = 'prompteur-v2';
+// Réseau d'abord (les mises à jour arrivent dès la réouverture), copie en cache si hors ligne.
+const CACHE = 'prompteur-v3';
 const ASSETS = ['./', './index.html', './app.js', './manifest.webmanifest', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -17,11 +17,12 @@ self.addEventListener('activate', e => {
 
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET' || !e.request.url.startsWith(self.location.origin)) return;
-  e.respondWith(caches.open(CACHE).then(async cache => {
-    const hit = await cache.match(e.request, { ignoreSearch: true });
-    const net = fetch(e.request)
-      .then(res => { if (res.ok) cache.put(e.request, res.clone()); return res; })
-      .catch(() => hit);
-    return hit || net;
-  }));
+  e.respondWith(
+    fetch(e.request, { cache: 'no-cache' })
+      .then(res => {
+        if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); }
+        return res;
+      })
+      .catch(() => caches.match(e.request, { ignoreSearch: true }))
+  );
 });

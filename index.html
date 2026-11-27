@@ -120,6 +120,16 @@ svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2;stroke-l
 #prompter.cam #flip{bottom:auto;height:45%;overflow:hidden;background:rgba(0,0,0,.55)}
 #prompter.cam #ptext{text-shadow:0 1px 3px rgba(0,0,0,.6)}
 #prompter.cam .fade,#prompter.cam #restart{display:none}
+/* Le flou d'arrière-plan recalculé sur une vidéo en direct fait saccader l'iPhone */
+#prompter.cam .pill,#prompter.cam .pill-btn{-webkit-backdrop-filter:none;backdrop-filter:none;background:rgba(28,28,30,.78)}
+#prompter.cam .pill-btn.on{background:var(--accent)}
+.dialog{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.6);display:grid;place-items:center;padding:24px}
+.dialog-box{background:var(--panel);color:var(--text);border-radius:18px;padding:22px 18px 16px;width:100%;max-width:340px}
+.dialog-box p{margin:0 0 18px;font-size:16px;line-height:1.45}
+.dialog-btns{display:flex;gap:10px}
+.dialog-btns button{flex:1;height:48px;border-radius:12px;background:var(--panel2);font-weight:600}
+#dialog-ok{background:var(--accent);color:#111}
+#dialog-ok.danger{background:var(--danger);color:#fff}
 .rec-btn{width:68px;height:68px;border-radius:50%;border:4px solid #fff;display:grid;place-items:center;background:rgba(0,0,0,.25)}
 .rec-btn span{width:50px;height:50px;border-radius:50%;background:#ff3b30;transition:.2s}
 .rec-btn.on span{width:26px;height:26px;border-radius:6px}
@@ -234,7 +244,7 @@ input[type=range]{width:100%;height:32px;margin:0;accent-color:var(--accent)}
 
   <div id="result" class="result" hidden>
     <div class="result-head"><b>Vidéo enregistrée</b><button id="result-done" class="link">Terminé</button></div>
-    <video id="result-video" controls playsinline></video>
+    <video id="result-video" controls playsinline preload="metadata"></video>
     <div class="result-actions">
       <button id="discard" class="link danger">Supprimer</button>
       <button id="save-video" class="primary">Enregistrer dans Photos</button>
@@ -258,12 +268,22 @@ input[type=range]{width:100%;height:32px;margin:0;accent-color:var(--accent)}
     <div class="field"><span>Alignement</span>
       <div class="seg" data-k="align"><button data-v="left">Gauche</button><button data-v="center">Centré</button></div>
     </div>
+    <div class="field"><span>Qualité vidéo (mode caméra)</span>
+      <div class="seg" data-k="q"><button data-v="720">720p · plus fluide</button><button data-v="1080">1080p</button></div>
+    </div>
     <label class="toggle"><span>Miroir horizontal<small>Pour un prompteur à vitre</small></span><input type="checkbox" class="switch" data-k="mirrorX"></label>
     <label class="toggle"><span>Miroir vertical</span><input type="checkbox" class="switch" data-k="mirrorY"></label>
     <label class="toggle"><span>Compte à rebours<small>3 secondes avant de démarrer</small></span><input type="checkbox" class="switch" data-k="countdown"></label>
     <button id="reset" class="link danger">Rétablir les réglages par défaut</button>
   </div>
 </section>
+
+<div id="dialog" class="dialog" hidden>
+  <div class="dialog-box" role="alertdialog">
+    <p id="dialog-msg"></p>
+    <div class="dialog-btns"><button id="dialog-cancel">Annuler</button><button id="dialog-ok">OK</button></div>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>
