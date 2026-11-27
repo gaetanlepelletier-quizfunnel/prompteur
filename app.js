@@ -492,26 +492,47 @@ async function camOn() {
   camStop();
   const [w, h] = S.q === '720' ? [1280, 720] : [1920, 1080];
   // Sans ces options, le micro passe en mode « appel téléphonique » : son étouffé et qui pompe.
-  const audio = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
-  if (S.micId) audio.deviceId = { exact: S.micId };
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: S.facing, width: { ideal: w }, height: { ideal: h }, frameRate: { ideal: 30, max: 30 } },
-      audio,
-    });
-  } catch (e) {
-    if (req !== C.req) return;
-    if (S.micId && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError')) {
-      // Le micro choisi est débranché : on repasse en automatique.
-      S.micId = '';
-      applySettings();
-      toast('Micro introuvable, retour au micro automatique');
-      return camOn();
+  const raw = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+  // Du plus exigeant au plus simple : si l'iPhone refuse un essai (micro choisi débranché,
+  // résolution refusée, caméra pas prête…), on tente le suivant avant d'abandonner.
+  const attempts = [
+    { video: { facingMode: S.facing, width: { ideal: w }, height: { ideal: h }, frameRate: { ideal: 30, max: 30 } },
+      audio: S.micId ? { ...raw, deviceId: { exact: S.micId } } : raw },
+    { video: { facingMode: S.facing }, audio: raw },
+    { video: { facingMode: S.facing }, audio: true },
+    { video: true, audio: true },
+  ];
+  let stream, err;
+  for (let i = 0; i < attempts.length && !stream; i++) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(attempts[i]);
+      if (i > 0 && S.micId) { S.micId = ''; store.set('prompteur.settings', S); toast('Micro choisi introuvable : micro automatique'); }
+    } catch (e) {
+      err = e;
+      if (req !== C.req) return;
+      if (e.name === 'NotAllowedError' || e.name === 'SecurityError') break; // refus d'autorisation : inutile d'insister
+      await new Promise(r => setTimeout(r, 300)); // laisse à l'iPhone le temps de libérer la caméra
+      if (req !== C.req) return;
     }
+  }
+  if (!stream) {
+    if (req !== C.req) return;
     S.cam = false;
     applySettings();
-    ask('Impossible d’accéder à la caméra. Autorisez la caméra et le micro dans Réglages > Safari, puis réessayez.', { cancel: null });
+    const name = (err && err.name) || 'erreur';
+    let msg;
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      msg = 'L’iPhone refuse l’accès à la caméra ou au micro.\n\n' +
+        '1. Ouvrez l’app Réglages → Apps → Safari.\n' +
+        '2. Descendez jusqu’à « Caméra » et « Microphone » : choisissez « Demander » ou « Autoriser ».\n' +
+        '3. Fermez complètement le Prompteur (balayez-le vers le haut), rouvrez-le, puis touchez « Autoriser » quand l’iPhone le demande.';
+    } else if (name === 'NotReadableError' || name === 'AbortError') {
+      msg = 'La caméra est déjà utilisée par une autre app (Appareil photo, FaceTime, appel en cours…).\n\nFermez cette app, puis touchez « Réessayer ».';
+    } else {
+      msg = 'Impossible d’accéder à la caméra.';
+    }
+    const retry = await ask(msg + '\n\n(code : ' + name + ')', { ok: 'Réessayer', cancel: 'Fermer' });
+    if (retry && view === 'prompter') { S.cam = true; applySettings(); camOn(); }
     return;
   }
   // L'utilisateur a quitté ou coupé la caméra pendant la demande d'autorisation
