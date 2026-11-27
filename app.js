@@ -15,7 +15,7 @@ const ICON = {
   pause: '<svg viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>',
 };
 
-const DEFAULTS = { wpm: 140, size: 44, margin: 6, lh: 1.35, guide: 30, theme: 'dark', align: 'left', mirrorX: false, mirrorY: false, countdown: true, cam: false, facing: 'user', q: '1080' };
+const DEFAULTS = { wpm: 140, size: 44, margin: 6, lh: 1.35, guide: 30, theme: 'dark', align: 'left', mirrorX: false, mirrorY: false, countdown: true, cam: false, facing: 'user', q: '1080', mic: 3 };
 let S = { ...DEFAULTS, ...store.get('prompteur.settings', {}) };
 
 const SAMPLE = `Bienvenue dans votre prompteur.
@@ -332,7 +332,7 @@ const closeSheet = () => sheet.classList.remove('open');
 $('#settings').onclick = () => (sheetOpen() ? closeSheet() : sheet.classList.add('open'));
 $('#sheet-close').onclick = closeSheet;
 
-const OUT = { wpm: v => v + ' mots/min', size: v => v + ' px', margin: v => v + ' %', lh: v => (+v).toFixed(2), guide: v => v + ' %' };
+const OUT = { wpm: v => v + ' mots/min', size: v => v + ' px', margin: v => v + ' %', lh: v => (+v).toFixed(2), guide: v => v + ' %', mic: v => '×' + v };
 
 function applySettings() {
   const st = pv.style;
@@ -348,6 +348,7 @@ function applySettings() {
   $('#cam-flip').hidden = $('#rec').hidden = !S.cam;
   $('#flip').style.transform = S.cam ? 'none' : `scale(${S.mirrorX ? -1 : 1},${S.mirrorY ? -1 : 1})`;
   $('#speed').textContent = S.wpm;
+  if (C.audio) C.audio.gain.gain.value = S.mic;
   store.set('prompteur.settings', S);
   syncSheet();
   layout();
@@ -391,6 +392,7 @@ document.addEventListener('visibilitychange', () => {
     pause();
   } else if (view === 'prompter') {
     keepAwake(true);
+    if (AC && AC.state !== 'running') AC.resume().catch(() => {});
     const track = C.stream && C.stream.getVideoTracks()[0];
     if (S.cam && (!track || track.readyState === 'ended')) camOn();
   }
@@ -408,8 +410,56 @@ if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.M
   S.cam = false;
 }
 
+// ---------- Son : amplification maison (compresseur + volume + limiteur) ----------
+// iOS exige que le moteur audio démarre pendant un toucher : audioCtx() est appelé dans les gestes.
+let AC = null;
+function audioCtx() {
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    if (AC.state !== 'running') AC.resume().catch(() => {});
+  } catch { AC = null; }
+  return AC;
+}
+const setParams = (node, params) => { for (const k in params) node[k].value = params[k]; return node; };
+function buildAudio() {
+  teardownAudio();
+  const tracks = C.stream ? C.stream.getAudioTracks() : [];
+  if (!AC || !tracks.length) return;
+  try {
+    const src = AC.createMediaStreamSource(new MediaStream(tracks));
+    const comp = setParams(AC.createDynamicsCompressor(), { threshold: -24, knee: 20, ratio: 3, attack: 0.005, release: 0.25 });
+    const gain = AC.createGain();
+    gain.gain.value = S.mic;
+    const lim = setParams(AC.createDynamicsCompressor(), { threshold: -4, knee: 0, ratio: 20, attack: 0.001, release: 0.1 });
+    const an = AC.createAnalyser();
+    an.fftSize = 1024;
+    const dest = AC.createMediaStreamDestination();
+    src.connect(comp).connect(gain).connect(lim);
+    lim.connect(dest);
+    lim.connect(an);
+    C.audio = { src, gain, lim, an, dest, buf: new Float32Array(an.fftSize) };
+  } catch { C.audio = null; }
+}
+function teardownAudio() {
+  if (!C.audio) return;
+  try { C.audio.src.disconnect(); C.audio.lim.disconnect(); } catch {}
+  C.audio = null;
+}
+// Barre de niveau du micro (dans les réglages et pendant l'enregistrement)
+setInterval(() => {
+  if (!C.audio || view !== 'prompter' || !(sheetOpen() || isRec())) return;
+  const { an, buf } = C.audio;
+  an.getFloatTimeDomainData(buf);
+  let peak = 0;
+  for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i]));
+  const db = 20 * Math.log10(peak || 1e-6);
+  const color = db > -2 ? '#ff3b30' : db > -24 ? '#34c759' : '#ffb020';
+  $$('.meter i').forEach(i => { i.style.width = clamp((db + 50) * 2, 0, 100) + '%'; i.style.background = color; });
+}, 100);
+
 async function camOn() {
   if (!$('#result').hidden) return; // pas de caméra pendant la relecture
+  audioCtx();
   const req = ++C.req;
   camStop();
   const [w, h] = S.q === '720' ? [1280, 720] : [1920, 1080];
@@ -430,11 +480,13 @@ async function camOn() {
   // L'utilisateur a quitté ou coupé la caméra pendant la demande d'autorisation
   if (req !== C.req || view !== 'prompter' || !S.cam) { stream.getTracks().forEach(t => t.stop()); return; }
   C.stream = stream;
+  buildAudio();
   camV.srcObject = stream;
   camV.classList.toggle('mirror', S.facing === 'user');
   camV.play().catch(() => {});
 }
 function camStop() {
+  teardownAudio();
   if (C.stream) C.stream.getTracks().forEach(t => t.stop());
   C.stream = null;
   camV.srcObject = null;
@@ -454,7 +506,7 @@ $('#cam-flip').onclick = () => {
 };
 
 function recTick() {
-  $('#rec-time').textContent = '● ' + fmt((Date.now() - C.t0) / 1000);
+  $('#rec-clock').textContent = '● ' + fmt((Date.now() - C.t0) / 1000);
 }
 function recStart() {
   if (!C.stream) { toast('Caméra pas encore prête'); return; }
@@ -465,8 +517,11 @@ function recStart() {
     C.chunks = [];
     const opts = { videoBitsPerSecond: S.q === '720' ? 5e6 : 8e6, audioBitsPerSecond: 128000 };
     if (MIME) opts.mimeType = MIME;
-    try { C.rec = new MediaRecorder(C.stream, opts); }
-    catch { C.rec = new MediaRecorder(C.stream); }
+    // Son amplifié si le moteur audio tourne ; sinon son brut (jamais de vidéo muette).
+    const boosted = C.audio && AC && AC.state === 'running';
+    const stream = boosted ? new MediaStream([...C.stream.getVideoTracks(), ...C.audio.dest.stream.getAudioTracks()]) : C.stream;
+    try { C.rec = new MediaRecorder(stream, opts); }
+    catch { C.rec = new MediaRecorder(stream); }
     C.rec.ondataavailable = e => { if (e.data && e.data.size) C.chunks.push(e.data); };
     C.rec.onstop = recDone;
     C.rec.start(); // sans découpage : plus fiable sur Safari
@@ -514,6 +569,7 @@ function closeResult() {
 }
 
 $('#rec').onclick = () => {
+  audioCtx();
   if (isRec()) recStop();
   else if (P.counting) pause();
   else recStart();
